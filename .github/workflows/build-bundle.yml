@@ -1,0 +1,251 @@
+name: Build offline bundle
+
+# Watches the upstream umtx2 repo and, whenever its main branch has new
+# commits since the last bundle release, packages the scaffolding + an
+# upstream snapshot into a self-contained tar.gz + zip and publishes them
+# as a GitHub Release. The release body lists the upstream commits since
+# the previous bundle so the changelog stays informative without any
+# manual tagging.
+
+on:
+  schedule:
+    # 60 minutes after the upstream payload-auto-update job (06:00 / 18:00 UTC)
+    # so we package the freshly-updated payload metadata in the same cycle.
+    - cron: '0 7,19 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build even if upstream has not advanced'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write   # create releases
+
+env:
+  UPSTREAM_REPO: kemalsanli/umtx2
+  UPSTREAM_REF:  main
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout scaffolding
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream HEAD
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_REF}" --jq .sha)
+          short="${sha:0:7}"
+          date=$(date -u +%Y.%m.%d)
+          tag="bundle-${date}-${short}"
+          {
+            echo "sha=${sha}"
+            echo "short=${short}"
+            echo "date=${date}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD: ${sha} (${short})"
+
+      - name: Look up last released upstream SHA
+        id: last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          last_tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [ -z "$last_tag" ]; then
+            echo "No previous release found"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "short=" >> "$GITHUB_OUTPUT"
+          else
+            # tag format: bundle-YYYY.MM.DD-shortsha
+            last_short=$(printf '%s' "$last_tag" | awk -F'-' '{print $NF}')
+            echo "Last release: ${last_tag} (upstream ${last_short})"
+            echo "tag=${last_tag}" >> "$GITHUB_OUTPUT"
+            echo "short=${last_short}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          force="${{ github.event.inputs.force }}"
+          last_short="${{ steps.last.outputs.short }}"
+          current_short="${{ steps.upstream.outputs.short }}"
+
+          if [ "$force" = "true" ]; then
+            build=true
+            reason="forced via workflow_dispatch"
+          elif [ -z "$last_short" ]; then
+            build=true
+            reason="no previous release, building first bundle"
+          elif [ "$last_short" = "$current_short" ]; then
+            build=false
+            reason="upstream unchanged since ${last_short}"
+          else
+            build=true
+            reason="upstream advanced ${last_short} -> ${current_short}"
+          fi
+
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "Decision: ${reason}"
+          echo "::notice::${reason}"
+
+      - name: Clone upstream
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          git clone --depth 100 --branch "${UPSTREAM_REF}" \
+            "https://github.com/${UPSTREAM_REPO}.git" _upstream
+
+      - name: Build changelog
+        if: steps.decide.outputs.build == 'true'
+        id: changelog
+        run: |
+          last_short="${{ steps.last.outputs.short }}"
+          current_sha="${{ steps.upstream.outputs.sha }}"
+
+          mkdir -p _release
+          {
+            echo "## Upstream changes"
+            echo ""
+
+            range=""
+            if [ -n "$last_short" ]; then
+              if git -C _upstream rev-parse "$last_short" >/dev/null 2>&1; then
+                range="${last_short}..${current_sha}"
+              fi
+            fi
+
+            if [ -n "$range" ]; then
+              echo "Commits in [\`${last_short}\`..\`${{ steps.upstream.outputs.short }}\`](https://github.com/${UPSTREAM_REPO}/compare/${last_short}...${{ steps.upstream.outputs.short }}):"
+              echo ""
+              git -C _upstream log --pretty='format:- %s ([`%h`](https://github.com/'"${UPSTREAM_REPO}"'/commit/%H))' "$range"
+            else
+              echo "Most recent commits at \`${{ steps.upstream.outputs.short }}\`:"
+              echo ""
+              git -C _upstream log -20 --pretty='format:- %s ([`%h`](https://github.com/'"${UPSTREAM_REPO}"'/commit/%H))' "${UPSTREAM_REF}"
+            fi
+            echo ""
+            echo ""
+          } > _release/changelog.md
+
+          echo "----- Changelog preview -----"
+          cat _release/changelog.md
+
+      - name: Stage bundle
+        if: steps.decide.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          stage="staging/${TAG}"
+          mkdir -p "$stage"
+
+          # Copy scaffolding (no .git, no .github, no _upstream / staging)
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='_upstream' \
+            --exclude='staging' \
+            --exclude='_release' \
+            ./ "$stage/"
+
+          # Embed the upstream snapshot (no .git to keep the bundle small)
+          rsync -a --exclude='.git' _upstream/ "$stage/umtx2/"
+
+          # Bundle-specific compose: bind-mount the embedded snapshot into the
+          # container instead of using a named volume + git clone at runtime.
+          cat > "$stage/docker-compose.yml" <<'EOF'
+          services:
+            umtx2:
+              build: .
+              image: umtx2-self-hosted:bundle
+              container_name: umtx2
+              restart: unless-stopped
+              ports:
+                - "${HOST_PORT:-8080}:80"
+              environment:
+                REPO_URL: ${REPO_URL:-https://github.com/kemalsanli/umtx2.git}
+                REPO_REF: ${REPO_REF:-main}
+                REPO_DIR: /srv/umtx2
+                DOC_ROOT_SUBPATH: document/en/ps5
+                TZ: ${TZ:-UTC}
+              volumes:
+                - ./umtx2:/srv/umtx2
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+                interval: 30s
+                timeout: 5s
+                retries: 3
+                start_period: 30s
+          EOF
+
+          # Offline-focused README
+          cat > "$stage/README.md" <<EOF
+          # umtx2-self-hosted offline bundle
+
+          Self-contained snapshot — no internet needed at runtime.
+
+          - Scaffolding @ \`${{ github.sha }}\` (umtx2-self-hosted)
+          - Upstream content @ \`${{ steps.upstream.outputs.short }}\` (umtx2, ${{ steps.upstream.outputs.date }})
+
+          ## Quick start
+
+          \`\`\`sh
+          docker compose up -d --build
+          \`\`\`
+
+          Then browse to \`http://<your-server-ip>:8080\` on the PS5.
+
+          ## Notes
+
+          - The upstream content is baked in at \`./umtx2/\` and bind-mounted into
+            the container. The internal git-pull cron is a no-op here (no \`.git\`)
+            so the container stays fully offline.
+          - To update, download a newer bundle release and re-run \`docker compose
+            up -d --build\` against it.
+
+          See the [main project README](https://github.com/kemalsanli/umtx2-self-hosted)
+          for the always-online setup and configuration reference.
+          EOF
+
+          # Create archives
+          tar -czf "${TAG}.tar.gz" -C "staging" "${TAG}"
+          (cd "staging" && zip -qr "../${TAG}.zip" "${TAG}")
+
+          echo "----- Bundle contents -----"
+          ls -lh "${TAG}".*
+
+      - name: Create release
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          {
+            cat _release/changelog.md
+            cat <<EOF
+
+          ## Install (offline)
+
+          1. Download \`${TAG}.tar.gz\` (or \`.zip\`) from the assets below
+          2. Extract: \`tar xzf ${TAG}.tar.gz && cd ${TAG}\`
+          3. Run: \`docker compose up -d --build\`
+          4. Browse to \`http://<your-server-ip>:8080\` on the PS5
+
+          The bundle includes the full upstream snapshot at upstream commit \`${{ steps.upstream.outputs.sha }}\` — no internet needed at runtime.
+          EOF
+          } > _release/notes.md
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file _release/notes.md \
+            "${TAG}.tar.gz" \
+            "${TAG}.zip"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "build=${{ steps.decide.outputs.build }}"
+          echo "tag=${{ steps.upstream.outputs.tag }}"

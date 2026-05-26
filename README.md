@@ -44,12 +44,14 @@ with the scaffolding **plus** a frozen snapshot of the upstream `umtx2`
 content baked in, so no runtime clone is needed.
 
 ```sh
-# On any machine with internet — download the bundle
-curl -LO https://github.com/kemalsanli/umtx2-self-hosted/releases/latest/download/<TAG>.tar.gz
+# On any machine with internet — resolve the latest tag and download the bundle
+TAG=$(curl -fsSL https://api.github.com/repos/kemalsanli/umtx2-self-hosted/releases/latest \
+        | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+curl -fLO "https://github.com/kemalsanli/umtx2-self-hosted/releases/latest/download/${TAG}.tar.gz"
 
-# Move it to the offline server (USB / scp / whatever), then:
-tar xzf <TAG>.tar.gz
-cd <TAG>
+# Move ${TAG}.tar.gz to the offline server (USB / scp / whatever), then:
+tar xzf "${TAG}.tar.gz"
+cd "${TAG}"
 docker compose up -d --build
 ```
 

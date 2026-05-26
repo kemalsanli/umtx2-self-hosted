@@ -1,6 +1,9 @@
-FROM nginx:1.27-alpine
+FROM nginx:1.30-alpine
 
-RUN apk add --no-cache git tini busybox-suid \
+# busybox in the base image already provides crond, wget, and flock.
+# We only need git for clone/pull and tini to reap crond's children
+# (nginx runs as PID 1 via exec and doesn't itself reap).
+RUN apk add --no-cache git tini \
     && rm -rf /var/cache/apk/*
 
 WORKDIR /srv

@@ -16,19 +16,36 @@ set -eu
 log() { printf '[entrypoint] %s\n' "$*"; }
 
 DOC_ROOT="$REPO_DIR/$DOC_ROOT_SUBPATH"
+LOCK_FILE=/var/lock/umtx2-update.lock
 
 if [ -d "$REPO_DIR/.git" ]; then
     log "$REPO_DIR is a git checkout, attempting fetch from $REPO_REF"
-    if git -C "$REPO_DIR" fetch --depth 1 origin "$REPO_REF" 2>&1; then
-        git -C "$REPO_DIR" reset --hard "origin/$REPO_REF"
-    else
-        log "WARN: fetch failed (offline?), continuing with current content"
-    fi
+    # Serialize fetch+reset under one lock so the cron-driven update.sh and
+    # a manual exec can never race and tear up the shallow clone mid-flight.
+    {
+        if flock -n 9; then
+            if git -C "$REPO_DIR" fetch --depth 1 origin "$REPO_REF" 2>&1; then
+                git -C "$REPO_DIR" reset --hard "origin/$REPO_REF"
+            else
+                log "WARN: fetch failed (offline?), continuing with current content"
+            fi
+        else
+            log "WARN: another update in progress, continuing with current content"
+        fi
+    } 9>"$LOCK_FILE"
 elif [ -f "$DOC_ROOT/index.html" ]; then
     log "$REPO_DIR has bundled content without .git, serving as-is"
+elif [ -n "$(ls -A "$REPO_DIR" 2>/dev/null)" ]; then
+    log "ERROR: $REPO_DIR has files but neither .git nor $DOC_ROOT_SUBPATH/index.html"
+    log "  -> looks like a half-populated volume. Remove its contents to force a fresh clone,"
+    log "     or place a complete upstream checkout (with .git OR with $DOC_ROOT_SUBPATH/index.html)."
+    exit 1
 else
     log "$REPO_DIR is empty, cloning $REPO_URL ($REPO_REF)"
-    git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$REPO_DIR"
+    if ! git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$REPO_DIR"; then
+        log "ERROR: clone failed — check REPO_URL ($REPO_URL) and REPO_REF ($REPO_REF), and network"
+        exit 1
+    fi
 fi
 
 if [ ! -f "$DOC_ROOT/index.html" ]; then

@@ -238,6 +238,13 @@ jobs:
           EOF
           } > _release/notes.md
 
+          # Force-dispatch may hit an existing tag (upstream unchanged but user
+          # asked for a rebuild). Recreate cleanly rather than failing the run.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, recreating"
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file _release/notes.md \

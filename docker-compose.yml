@@ -1,0 +1,25 @@
+services:
+  umtx2:
+    build: .
+    image: umtx2-self-hosted:latest
+    container_name: umtx2
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:80"
+    environment:
+      REPO_URL: ${REPO_URL:-https://github.com/kemalsanli/umtx2.git}
+      REPO_REF: ${REPO_REF:-main}
+      REPO_DIR: /srv/umtx2
+      DOC_ROOT_SUBPATH: document/en/ps5
+      TZ: ${TZ:-UTC}
+    volumes:
+      - umtx2-repo:/srv/umtx2
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  umtx2-repo:
